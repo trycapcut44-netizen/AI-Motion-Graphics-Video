@@ -19,7 +19,7 @@ class SpeechSynchronizer:
         self.inspector = MediaInspector(ffmpeg_path=self.ffmpeg_path)
 
     def measure_audio_duration(self, audio_path: Path) -> float:
-        """Measure precise duration of an audio clip."""
+        """Measure precise duration of an audio clip in seconds."""
         meta = self.inspector.inspect(audio_path)
         return meta.duration
 
@@ -28,21 +28,26 @@ class SpeechSynchronizer:
         segment_audio_path: Path,
         start_time: float,
         end_time: float,
-        output_path: Path
+        output_path: Path,
+        max_duration: Optional[float] = None
     ) -> float:
         """
-        Trims artificial leading/trailing TTS silence, adjusts tempo smoothly if
-        needed to fit the target window, and adds smooth micro-fades.
-        Returns the final duration of the fitted segment.
+        Trims artificial leading/trailing TTS dead-air, adjusts tempo smoothly to
+        fit the target spoken window, clamps to max_duration to prevent segment collisions,
+        and adds smooth micro-fades for seamless lip-sync.
+        Returns the final duration of the fitted audio file.
         """
-        target_duration = max(0.2, end_time - start_time)
+        target_duration = max(0.15, end_time - start_time)
+        hard_max_duration = max_duration if (max_duration is not None and max_duration > 0.15) else (target_duration + 0.15)
 
-        # 1. Trim artificial silence generated at start/end by TTS engine
+        # 1. Strip artificial silence generated at start/end by TTS engines
+        # Neural TTS engines (Edge-TTS, Gemini-TTS) insert 100-300ms of dead air.
+        # Removing leading silence ensures speech audio starts at t=0 when actor opens mouth.
         trimmed_temp = output_path.parent / f"trim_{uuid.uuid4().hex[:8]}.wav"
         filter_trim = (
-            "silenceremove=start_periods=1:start_duration=0.02:start_threshold=-42dB,"
+            "silenceremove=start_periods=1:start_duration=0.01:start_threshold=-45dB,"
             "areverse,"
-            "silenceremove=start_periods=1:start_duration=0.02:start_threshold=-42dB,"
+            "silenceremove=start_periods=1:start_duration=0.01:start_threshold=-45dB,"
             "areverse"
         )
         cmd_trim = [
@@ -65,31 +70,55 @@ class SpeechSynchronizer:
 
         actual_duration = self.measure_audio_duration(active_input)
         if actual_duration <= 0.05:
-            # Fallback for degenerate audio
+            # Fallback for degenerate/empty audio
             if active_input != segment_audio_path and trimmed_temp.exists():
-                trimmed_temp.unlink()
+                try:
+                    trimmed_temp.unlink()
+                except Exception:
+                    pass
             return actual_duration
 
-        # 2. Determine optimal tempo adjustment
+        # 2. Determine tempo adjustment for natural lip synchronization
         tempo = 1.0
-        if actual_duration > target_duration:
-            # Speech is longer than window: compress up to 1.30x for natural cadence
-            tempo = min(1.30, max(1.0, actual_duration / target_duration))
+        if actual_duration > hard_max_duration:
+            # Speech is longer than window: compress tempo so dialogue completes within mouth movement
+            tempo = actual_duration / target_duration
+            # Allow up to 2.2x speedup if translation was much longer
+            tempo = min(2.2, max(1.0, tempo))
+        elif actual_duration > target_duration:
+            tempo = min(1.5, actual_duration / target_duration)
         elif actual_duration < target_duration * 0.70 and actual_duration > 0.6:
-            # Speech was delivered significantly faster than video pace: relax slightly
-            tempo = max(0.92, actual_duration / (target_duration * 0.85))
+            # Speech was delivered faster than visual dialogue window: relax slightly for natural flow
+            tempo = max(0.88, actual_duration / (target_duration * 0.85))
 
-        # 3. Apply tempo and micro-fades (10ms) to eliminate audio clicks
+        # 3. Build FFmpeg audio filter chain (handling atempo range limits)
         filters = []
         if abs(tempo - 1.0) > 0.02:
-            filters.append(f"atempo={tempo:.3f}")
-        
-        # Estimate expected post-tempo duration for fade-out positioning
+            # FFmpeg atempo filter allows 0.5 to 2.0; chain filters if > 2.0
+            if tempo > 2.0:
+                filters.append("atempo=2.0")
+                filters.append(f"atempo={tempo / 2.0:.3f}")
+            elif tempo < 0.5:
+                filters.append("atempo=0.5")
+                filters.append(f"atempo={tempo / 0.5:.3f}")
+            else:
+                filters.append(f"atempo={tempo:.3f}")
+
+        # Post-tempo duration estimate
         est_dur = actual_duration / tempo
-        fade_dur = 0.015
-        if est_dur > fade_dur * 2:
-            filters.append(f"afade=t=in:ss=0:d={fade_dur:.3f}")
-            filters.append(f"afade=t=out:st={max(0.0, est_dur - fade_dur):.3f}:d={fade_dur:.3f}")
+
+        # If estimated duration still exceeds hard_max_duration, trim cleanly with fade-out
+        if est_dur > hard_max_duration:
+            fade_len = min(0.04, hard_max_duration * 0.1)
+            filters.append(f"atrim=0:{hard_max_duration:.3f}")
+            filters.append(f"afade=t=out:st={max(0.0, hard_max_duration - fade_len):.3f}:d={fade_len:.3f}")
+            est_dur = hard_max_duration
+        else:
+            # Micro-fades (10ms) to eliminate boundary pops/clicks
+            fade_dur = min(0.012, est_dur * 0.1)
+            if est_dur > fade_dur * 2:
+                filters.append(f"afade=t=in:ss=0:d={fade_dur:.3f}")
+                filters.append(f"afade=t=out:st={max(0.0, est_dur - fade_dur):.3f}:d={fade_dur:.3f}")
 
         filter_str = ",".join(filters) if filters else "anull"
 
@@ -115,7 +144,7 @@ class SpeechSynchronizer:
 
     def generate_silence(self, duration_sec: float, output_path: Path) -> Path:
         """Generate a silent stereo WAV file with exact duration."""
-        dur = max(0.01, duration_sec)
+        dur = max(0.005, duration_sec)
         cmd = [
             self.ffmpeg_path,
             "-y",
@@ -136,8 +165,10 @@ class SpeechSynchronizer:
     ) -> Path:
         """
         Assembles all speech segments sequentially on a unified timeline matching
-        total video duration. Eliminates awkward artificial pauses and maintains
-        natural conversational dialogue flow between sentences.
+        total video duration. Ensures ZERO lip-sync drift:
+        - Every dialogue starts at the exact second/frame the character begins speaking.
+        - Speech is fitted into the visual window without spilling into the next scene.
+        - Natural scene pauses in the video are preserved accurately.
         """
         if not segments:
             # No dialogue segments, generate complete silence
@@ -153,58 +184,45 @@ class SpeechSynchronizer:
 
         current_time = 0.0
         part_idx = 0
-        prev_end = 0.0
 
         for i, (start, end, raw_audio) in enumerate(sorted_segs):
-            orig_gap = max(0.0, start - prev_end)
+            # Target start time of the current segment
+            target_start = max(0.0, start)
 
-            if i == 0:
-                # Initial delay before dialogue starts
-                if start > 0.05:
-                    lead_silence = min(start, 0.35)
-                    silence_file = temp_dir / f"silence_lead.wav"
-                    self.generate_silence(lead_silence, silence_file)
-                    file_entries.append(silence_file)
-                    current_time += lead_silence
-            else:
-                # In between sentences:
-                if current_time < start:
-                    time_gap = start - current_time
-                    # If original speaker spoke continuously (gap < 0.8s):
-                    # Keep a natural breath pause (150ms - 250ms), eliminating dead gaps
-                    if orig_gap < 0.8:
-                        pause_len = max(0.12, min(0.25, time_gap))
-                    else:
-                        # Original video had a genuine scene or visual pause:
-                        # Allow proportionate pause capped at 1.0s max
-                        pause_len = max(0.15, min(1.0, orig_gap, time_gap))
-
+            # If current timeline is behind the target start time, insert EXACT silence
+            # so the dialogue starts at the EXACT second the character speaks on screen!
+            if current_time < target_start:
+                gap = target_start - current_time
+                if gap >= 0.005:  # >= 5 milliseconds
                     silence_file = temp_dir / f"silence_{part_idx}.wav"
-                    self.generate_silence(pause_len, silence_file)
+                    self.generate_silence(gap, silence_file)
+                    actual_gap = self.measure_audio_duration(silence_file)
                     file_entries.append(silence_file)
-                    current_time += pause_len
+                    current_time += actual_gap
                     part_idx += 1
-                else:
-                    # Speech reached or slightly exceeded current start:
-                    # Add small 80ms micro-pause so sentences never collide
-                    micro_file = temp_dir / f"silence_micro_{part_idx}.wav"
-                    self.generate_silence(0.08, micro_file)
-                    file_entries.append(micro_file)
-                    current_time += 0.08
-                    part_idx += 1
+
+            # Next segment start time to prevent collisions
+            next_start = sorted_segs[i + 1][0] if (i + 1 < len(sorted_segs)) else total_video_duration
+            # Maximum allowed time before the next dialogue must begin
+            max_available = max(0.15, next_start - current_time - 0.02)
 
             # Fit and add segment audio
             fitted_audio = temp_dir / f"fitted_{part_idx}.wav"
-            fitted_dur = self.fit_segment_audio(raw_audio, start, end, fitted_audio)
+            fitted_dur = self.fit_segment_audio(
+                raw_audio,
+                start_time=current_time,
+                end_time=max(current_time + 0.15, end),
+                output_path=fitted_audio,
+                max_duration=max_available
+            )
             file_entries.append(fitted_audio)
             current_time += fitted_dur
             part_idx += 1
-            prev_end = end
 
         # Fill remaining duration to match total video length
         if current_time < total_video_duration:
             final_gap = total_video_duration - current_time
-            if final_gap > 0.02:
+            if final_gap >= 0.005:
                 silence_file = temp_dir / "silence_end.wav"
                 self.generate_silence(final_gap, silence_file)
                 file_entries.append(silence_file)

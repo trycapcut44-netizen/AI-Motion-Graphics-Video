@@ -58,7 +58,8 @@ class GeminiProvider(
             "   DO NOT lump multiple speakers together under 'Speaker 1'!\n"
             "3. For EACH dialogue line, accurately detect the speaker's biological gender from their voice acoustics: 'male' (low pitch / masculine voice) or 'female' (high pitch / feminine voice).\n"
             "4. Keep speaker IDs consistent across all occurrences of the same character throughout the video.\n"
-            "5. Identify emotional tone (e.g., 'neutral', 'excited', 'serious', 'happy', 'angry', 'whispering').\n\n"
+            "5. Identify emotional tone (e.g., 'neutral', 'excited', 'serious', 'happy', 'angry', 'whispering').\n"
+            "6. FRAME-ACCURATE TIMESTAMPS FOR LIP-SYNC: start_time must mark the exact moment the speaker's voice starts, and end_time must mark the exact moment they finish speaking. Do not add artificial padding.\n\n"
             "Example Multi-Character Output Structure:\n"
             "[\n"
             '  {"speaker_id": "Speaker 1", "speaker_gender": "male", "emotion": "serious", "start_time": 0.0, "end_time": 3.2, "text": "First dialogue by a male character."},\n'
@@ -147,7 +148,10 @@ class GeminiProvider(
                 "text": seg.text,
                 "speaker": seg.speaker_id,
                 "gender": getattr(seg, "speaker_gender", "male"),
-                "emotion": getattr(seg, "emotion", "neutral")
+                "emotion": getattr(seg, "emotion", "neutral"),
+                "start_time": round(seg.start_time, 2),
+                "end_time": round(seg.end_time, 2),
+                "duration_seconds": max(0.2, round(seg.end_time - seg.start_time, 2))
             }
             for i, seg in enumerate(segments)
         ]
@@ -159,7 +163,7 @@ class GeminiProvider(
             f"CRITICAL REQUIREMENTS FOR DUBBING & LIP SYNC: "
             f"1. GENDER CONJUGATION: Match the speaker's detected gender (e.g. In Hindi/Urdu, male speakers use masculine verb endings like 'karta hoon/gaya tha', while female speakers use feminine verb endings like 'karti hoon/gayi thi'). "
             f"2. EMOTION & DELIVERY: Preserve the emotional intent, nuance, and character personality. "
-            f"3. LIP SYNC SYLLABLE MATCHING: Ensure the translated dialogue has a spoken length and cadence that naturally fits the character's mouth movement. "
+            f"3. STRICT LIP-SYNC SYLLABLE & DURATION BUDGET: Each segment has an exact 'duration_seconds' during which the character's mouth moves on screen. Your translated dialogue MUST have approximately the same number of spoken syllables and pace as the source dialogue so that the speech starts and finishes naturally matching the character's lip movement. Do not create long or overly wordy translations. "
             "Return ONLY a JSON array of objects: "
             '[{\n  "index": 0,\n  "translated_text": "Translated sentence"\n}]\n'
             f"Input segments:\n{json.dumps(input_payload, ensure_ascii=False)}"
