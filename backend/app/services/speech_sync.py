@@ -78,18 +78,19 @@ class SpeechSynchronizer:
                     pass
             return actual_duration
 
-        # 2. Determine tempo adjustment for natural lip synchronization
+        # 2. Determine tempo adjustment for stable, uniform, natural voice speed
+        # To prevent the voice from sounding jarringly fast in one sentence and slow/sluggish
+        # in the next ("kabhi zyada kabhi kam"), we enforce a tight, natural speed band [1.0x, 1.15x]:
+        # - NEVER slow down below 1.0x (slowing down human voice sounds drowsy, slurred, and artificial).
+        # - NEVER speed up past 1.18x (speeds over 1.2x sound cartoonish and rushed like fast-forward).
         tempo = 1.0
-        if actual_duration > hard_max_duration:
-            # Speech is longer than window: compress tempo so dialogue completes within mouth movement
-            tempo = actual_duration / target_duration
-            # Allow up to 2.2x speedup if translation was much longer
-            tempo = min(2.2, max(1.0, tempo))
-        elif actual_duration > target_duration:
-            tempo = min(1.5, actual_duration / target_duration)
-        elif actual_duration < target_duration * 0.70 and actual_duration > 0.6:
-            # Speech was delivered faster than visual dialogue window: relax slightly for natural flow
-            tempo = max(0.88, actual_duration / (target_duration * 0.85))
+        if actual_duration > target_duration:
+            # Mild compression (max 1.15x) so speed remains completely natural to human ears
+            tempo = min(1.15, max(1.0, actual_duration / target_duration))
+
+        # If speech still strictly exceeds the available hard boundary before the next speaker:
+        if (actual_duration / tempo) > hard_max_duration:
+            tempo = min(1.18, max(1.0, actual_duration / hard_max_duration))
 
         # 3. Build FFmpeg audio filter chain (handling atempo range limits)
         filters = []

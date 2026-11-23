@@ -142,8 +142,12 @@ class GeminiProvider(
 
         from google.genai import types
 
-        input_payload = [
-            {
+        input_payload = []
+        for i, seg in enumerate(segments):
+            dur = max(0.3, round(seg.end_time - seg.start_time, 2))
+            # Natural human speaking rate in Hindi/Urdu/Spanish/Filipino is ~2.3 - 2.8 words/sec
+            word_budget = max(2, int(round(dur * 2.5)))
+            input_payload.append({
                 "index": i,
                 "text": seg.text,
                 "speaker": seg.speaker_id,
@@ -151,19 +155,18 @@ class GeminiProvider(
                 "emotion": getattr(seg, "emotion", "neutral"),
                 "start_time": round(seg.start_time, 2),
                 "end_time": round(seg.end_time, 2),
-                "duration_seconds": max(0.2, round(seg.end_time - seg.start_time, 2))
-            }
-            for i, seg in enumerate(segments)
-        ]
+                "duration_seconds": dur,
+                "max_words_budget": word_budget
+            })
 
         prompt = (
             f"You are a master cinematic dialogue translator and lip-sync localization expert. "
             f"Translate the following speech segments from {source_language} to {target_language}. "
             f"Style: {style} (preserve natural conversational rhythm, tone, idioms, names, and numbers). "
-            f"CRITICAL REQUIREMENTS FOR DUBBING & LIP SYNC: "
+            f"CRITICAL REQUIREMENTS FOR DUBBING & CONSISTENT VOICE SPEED: "
             f"1. GENDER CONJUGATION: Match the speaker's detected gender (e.g. In Hindi/Urdu, male speakers use masculine verb endings like 'karta hoon/gaya tha', while female speakers use feminine verb endings like 'karti hoon/gayi thi'). "
             f"2. EMOTION & DELIVERY: Preserve the emotional intent, nuance, and character personality. "
-            f"3. STRICT LIP-SYNC SYLLABLE & DURATION BUDGET: Each segment has an exact 'duration_seconds' during which the character's mouth moves on screen. Your translated dialogue MUST have approximately the same number of spoken syllables and pace as the source dialogue so that the speech starts and finishes naturally matching the character's lip movement. Do not create long or overly wordy translations. "
+            f"3. STRICT UNIFORM VOICE SPEED (NO RUSHING, NO DRAGGING): Each segment has an exact 'duration_seconds' and a 'max_words_budget'. To prevent the dubbing voice from speaking too fast in one sentence and too slow in another, your translation MUST stay strictly within 'max_words_budget' words. If literal translation is long, rephrase concisely into natural cinematic phrasing so the actor delivers their line at a steady, normal human pace (1.0x). "
             "Return ONLY a JSON array of objects: "
             '[{\n  "index": 0,\n  "translated_text": "Translated sentence"\n}]\n'
             f"Input segments:\n{json.dumps(input_payload, ensure_ascii=False)}"
