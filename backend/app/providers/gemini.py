@@ -59,7 +59,8 @@ class GeminiProvider(
             "3. For EACH dialogue line, accurately detect the speaker's biological gender from their voice acoustics: 'male' (low pitch / masculine voice) or 'female' (high pitch / feminine voice).\n"
             "4. Keep speaker IDs consistent across all occurrences of the same character throughout the video.\n"
             "5. Identify emotional tone (e.g., 'neutral', 'excited', 'serious', 'happy', 'angry', 'whispering').\n"
-            "6. FRAME-ACCURATE TIMESTAMPS FOR LIP-SYNC: start_time must mark the exact moment the speaker's voice starts, and end_time must mark the exact moment they finish speaking. Do not add artificial padding.\n\n"
+            "6. FRAME-ACCURATE TIMESTAMPS: start_time must mark the exact moment the speaker's voice starts, and end_time must mark when they finish speaking.\n"
+            "7. ABSOLUTE COMPLETENESS (ZERO MISSING DIALOGUES): You MUST transcribe 100% of ALL spoken dialogue, words, sentences, questions, exclamations, and replies from the very first second to the very end of the audio. DO NOT OMIT, skip, drop, or summarize ANY dialogue line, even short replies (e.g. 'Yes', 'No', 'Wait', 'Right', 'Hello', 'Okay').\n\n"
             "Example Multi-Character Output Structure:\n"
             "[\n"
             '  {"speaker_id": "Speaker 1", "speaker_gender": "male", "emotion": "serious", "start_time": 0.0, "end_time": 3.2, "text": "First dialogue by a male character."},\n'
@@ -111,21 +112,41 @@ class GeminiProvider(
             # Strip potential ```json wrappers if present
             clean_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text.strip(), flags=re.MULTILINE)
             data = json.loads(clean_json)
+
+            # Handle dict wrapper like {"segments": [...]}
+            if isinstance(data, dict):
+                for k in ["segments", "transcript", "dialogues", "data", "result", "items"]:
+                    if k in data and isinstance(data[k], list):
+                        data = data[k]
+                        break
+                else:
+                    vals = list(data.values())
+                    data = vals[0] if (vals and isinstance(vals[0], list)) else []
+
             segments = []
             for item in data:
+                if not isinstance(item, dict):
+                    continue
                 raw_gender = str(item.get("speaker_gender") or item.get("gender") or "male").lower().strip()
                 if raw_gender not in ["male", "female"]:
                     raw_gender = "male"
+                text = str(item.get("text", "")).strip()
+                if not text:
+                    continue
+                start_val = max(0.0, float(item.get("start_time", 0.0)))
+                end_val = max(start_val + 0.1, float(item.get("end_time", start_val + 1.0)))
                 segments.append(
                     RawTranscriptSegment(
                         speaker_id=str(item.get("speaker_id", "Speaker 1")),
                         speaker_gender=raw_gender,
                         emotion=str(item.get("emotion", "neutral")),
-                        start_time=float(item.get("start_time", 0.0)),
-                        end_time=float(item.get("end_time", 0.0)),
-                        text=str(item.get("text", "")).strip()
+                        start_time=start_val,
+                        end_time=end_val,
+                        text=text
                     )
                 )
+            # Ensure chronological order
+            segments.sort(key=lambda s: s.start_time)
             return segments
         except Exception as e:
             raise RuntimeError(f"Failed to parse Gemini transcription output: {e}\nRaw response: {response.text}")
@@ -212,10 +233,31 @@ class GeminiProvider(
             raw_text = response.text or "[]"
             clean_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text.strip(), flags=re.MULTILINE)
             results = json.loads(clean_json)
-            
-            # Map by index to ensure proper sequence
-            trans_map = {item["index"]: item["translated_text"] for item in results}
-            return [trans_map.get(i, segments[i].text) for i in range(len(segments))]
+
+            # Handle dict wrapper
+            if isinstance(results, dict):
+                for k in ["translations", "results", "segments", "data", "items"]:
+                    if k in results and isinstance(results[k], list):
+                        results = results[k]
+                        break
+                else:
+                    vals = list(results.values())
+                    results = vals[0] if (vals and isinstance(vals[0], list)) else []
+
+            # Map by index with fallbacks
+            trans_map = {}
+            for idx, item in enumerate(results):
+                if isinstance(item, dict):
+                    raw_idx = item.get("index")
+                    try:
+                        int_idx = int(raw_idx)
+                    except (ValueError, TypeError):
+                        int_idx = idx
+                    text = item.get("translated_text") or item.get("text") or item.get("translation") or ""
+                    if text:
+                        trans_map[int_idx] = str(text).strip()
+
+            return [(trans_map.get(i) or segments[i].text) for i in range(len(segments))]
         except Exception as e:
             raise RuntimeError(f"Failed to parse Gemini translation: {e}\nRaw response: {response.text}")
 

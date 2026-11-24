@@ -32,24 +32,22 @@ class SpeechSynchronizer:
         max_duration: Optional[float] = None
     ) -> float:
         """
-        Trims artificial leading/trailing TTS dead-air, adjusts tempo smoothly to
-        fit the target spoken window, clamps to max_duration to prevent segment collisions,
-        and adds smooth micro-fades for seamless lip-sync.
+        Fits audio segment to the spoken window using smooth, pitch-preserving tempo adjustment.
+        NEVER uses destructive 'atrim' truncation so that NO dialogue words are ever cut off or missing.
+        Trims artificial leading TTS dead-air without damaging trailing words.
         Returns the final duration of the fitted audio file.
         """
-        target_duration = max(0.15, end_time - start_time)
-        hard_max_duration = max_duration if (max_duration is not None and max_duration > 0.15) else (target_duration + 0.15)
+        orig_duration = self.measure_audio_duration(segment_audio_path)
+        if orig_duration <= 0.05:
+            # Degenerate audio, return as-is
+            return orig_duration
 
-        # 1. Strip artificial silence generated at start/end by TTS engines
-        # Neural TTS engines (Edge-TTS, Gemini-TTS) insert 100-300ms of dead air.
-        # Removing leading silence ensures speech audio starts at t=0 when actor opens mouth.
+        target_duration = max(0.2, end_time - start_time)
+
+        # 1. Strip ONLY artificial leading silence from TTS engine
+        # Do NOT reverse and strip trailing silence, which could cut off whispered or soft ending words!
         trimmed_temp = output_path.parent / f"trim_{uuid.uuid4().hex[:8]}.wav"
-        filter_trim = (
-            "silenceremove=start_periods=1:start_duration=0.01:start_threshold=-45dB,"
-            "areverse,"
-            "silenceremove=start_periods=1:start_duration=0.01:start_threshold=-45dB,"
-            "areverse"
-        )
+        filter_trim = "silenceremove=start_periods=1:start_duration=0.02:start_threshold=-40dB"
         cmd_trim = [
             self.ffmpeg_path,
             "-y",
@@ -64,13 +62,15 @@ class SpeechSynchronizer:
         try:
             res = subprocess.run(cmd_trim, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if res.returncode == 0 and trimmed_temp.exists() and trimmed_temp.stat().st_size > 1000:
-                active_input = trimmed_temp
+                trimmed_dur = self.measure_audio_duration(trimmed_temp)
+                # Ensure leading silence removal didn't delete the speech
+                if trimmed_dur >= 0.1 and trimmed_dur >= orig_duration * 0.4:
+                    active_input = trimmed_temp
         except Exception:
             active_input = segment_audio_path
 
         actual_duration = self.measure_audio_duration(active_input)
         if actual_duration <= 0.05:
-            # Fallback for degenerate/empty audio
             if active_input != segment_audio_path and trimmed_temp.exists():
                 try:
                     trimmed_temp.unlink()
@@ -78,24 +78,16 @@ class SpeechSynchronizer:
                     pass
             return actual_duration
 
-        # 2. Determine tempo adjustment for stable, uniform, natural voice speed
-        # To prevent the voice from sounding jarringly fast in one sentence and slow/sluggish
-        # in the next ("kabhi zyada kabhi kam"), we enforce a tight, natural speed band [1.0x, 1.15x]:
-        # - NEVER slow down below 1.0x (slowing down human voice sounds drowsy, slurred, and artificial).
-        # - NEVER speed up past 1.18x (speeds over 1.2x sound cartoonish and rushed like fast-forward).
+        # 2. Determine tempo adjustment
+        # If speech is longer than target window, mildly speed up (up to 1.55x) so it fits naturally.
+        # NEVER slow down below 1.0x (slowing down human voice causes drowsy/robotic distortion).
         tempo = 1.0
         if actual_duration > target_duration:
-            # Mild compression (max 1.15x) so speed remains completely natural to human ears
-            tempo = min(1.15, max(1.0, actual_duration / target_duration))
-
-        # If speech still strictly exceeds the available hard boundary before the next speaker:
-        if (actual_duration / tempo) > hard_max_duration:
-            tempo = min(1.18, max(1.0, actual_duration / hard_max_duration))
+            tempo = min(1.55, max(1.0, actual_duration / target_duration))
 
         # 3. Build FFmpeg audio filter chain (handling atempo range limits)
         filters = []
         if abs(tempo - 1.0) > 0.02:
-            # FFmpeg atempo filter allows 0.5 to 2.0; chain filters if > 2.0
             if tempo > 2.0:
                 filters.append("atempo=2.0")
                 filters.append(f"atempo={tempo / 2.0:.3f}")
@@ -108,18 +100,11 @@ class SpeechSynchronizer:
         # Post-tempo duration estimate
         est_dur = actual_duration / tempo
 
-        # If estimated duration still exceeds hard_max_duration, trim cleanly with fade-out
-        if est_dur > hard_max_duration:
-            fade_len = min(0.04, hard_max_duration * 0.1)
-            filters.append(f"atrim=0:{hard_max_duration:.3f}")
-            filters.append(f"afade=t=out:st={max(0.0, hard_max_duration - fade_len):.3f}:d={fade_len:.3f}")
-            est_dur = hard_max_duration
-        else:
-            # Micro-fades (10ms) to eliminate boundary pops/clicks
-            fade_dur = min(0.012, est_dur * 0.1)
-            if est_dur > fade_dur * 2:
-                filters.append(f"afade=t=in:ss=0:d={fade_dur:.3f}")
-                filters.append(f"afade=t=out:st={max(0.0, est_dur - fade_dur):.3f}:d={fade_dur:.3f}")
+        # Micro-fades (10ms) to eliminate boundary pops/clicks (NO atrim truncation!)
+        fade_dur = min(0.012, est_dur * 0.1)
+        if est_dur > fade_dur * 2:
+            filters.append(f"afade=t=in:ss=0:d={fade_dur:.3f}")
+            filters.append(f"afade=t=out:st={max(0.0, est_dur - fade_dur):.3f}:d={fade_dur:.3f}")
 
         filter_str = ",".join(filters) if filters else "anull"
 
@@ -166,13 +151,12 @@ class SpeechSynchronizer:
     ) -> Path:
         """
         Assembles all speech segments sequentially on a unified timeline matching
-        total video duration. Ensures ZERO lip-sync drift:
-        - Every dialogue starts at the exact second/frame the character begins speaking.
-        - Speech is fitted into the visual window without spilling into the next scene.
-        - Natural scene pauses in the video are preserved accurately.
+        total video duration. Guarantees 100% DIALOGUE COMPLETENESS:
+        - Every dialogue line plays in full with ZERO truncated words.
+        - Exactly timed start points when characters open their mouths.
+        - Preserves natural video scene pauses.
         """
         if not segments:
-            # No dialogue segments, generate complete silence
             return self.generate_silence(total_video_duration, final_output_path)
 
         # Sort segments by start time
@@ -187,11 +171,9 @@ class SpeechSynchronizer:
         part_idx = 0
 
         for i, (start, end, raw_audio) in enumerate(sorted_segs):
-            # Target start time of the current segment
             target_start = max(0.0, start)
 
-            # If current timeline is behind the target start time, insert EXACT silence
-            # so the dialogue starts at the EXACT second the character speaks on screen!
+            # If current timeline position is before dialogue start, add exact silence padding
             if current_time < target_start:
                 gap = target_start - current_time
                 if gap >= 0.005:  # >= 5 milliseconds
@@ -202,19 +184,13 @@ class SpeechSynchronizer:
                     current_time += actual_gap
                     part_idx += 1
 
-            # Next segment start time to prevent collisions
-            next_start = sorted_segs[i + 1][0] if (i + 1 < len(sorted_segs)) else total_video_duration
-            # Maximum allowed time before the next dialogue must begin
-            max_available = max(0.15, next_start - current_time - 0.02)
-
-            # Fit and add segment audio
+            # Fit and add segment audio (guaranteeing 100% full speech, zero word truncation)
             fitted_audio = temp_dir / f"fitted_{part_idx}.wav"
             fitted_dur = self.fit_segment_audio(
                 raw_audio,
-                start_time=current_time,
-                end_time=max(current_time + 0.15, end),
-                output_path=fitted_audio,
-                max_duration=max_available
+                start_time=start,
+                end_time=end,
+                output_path=fitted_audio
             )
             file_entries.append(fitted_audio)
             current_time += fitted_dur

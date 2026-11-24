@@ -277,11 +277,11 @@ async def run_dubbing_pipeline(job_id: str, project_id: str):
         video_path = settings.UPLOADS_DIR / original_asset.private_storage_key
         segments = db.query(TranscriptSegment).filter(
             TranscriptSegment.project_id == project_id,
-            TranscriptSegment.is_approved == True
+            TranscriptSegment.is_approved != False
         ).order_by(TranscriptSegment.start_time).all()
 
         if not segments:
-            raise ValueError("No approved transcript segments to dub.")
+            raise ValueError("No transcript segments found to dub.")
 
         voice_config = db.query(VoiceConfiguration).filter(VoiceConfiguration.project_id == project_id).first()
 
@@ -335,7 +335,7 @@ async def run_dubbing_pipeline(job_id: str, project_id: str):
 
         segment_clips: List[Tuple[float, float, Path]] = []
         for i, seg in enumerate(segments):
-            text_to_speak = seg.translated_text or seg.source_text
+            text_to_speak = (seg.translated_text or "").strip() or seg.source_text
             clip_path = temp_dir / f"seg_{i}.mp3"
             
             # Select appropriate voice according to mode and character
